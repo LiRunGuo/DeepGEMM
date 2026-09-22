@@ -163,16 +163,24 @@ sm90_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
         float sqr_sum_acc_0 = 0;
         float sqr_sum_acc_1 = 0;
 
-        #pragma unroll kNumStages < 8 ? kNumStages : kNumStages / 2
-        for (uint32_t s = 0; s < num_total_stages; ++ s) {
+        constexpr uint32_t kNumRegPerWgmma = WGMMA::M * WGMMA::K / 128;
+        constexpr uint32_t kNumWgmmaPerBlockK = BLOCK_K / WGMMA::K;
+
+        // NOTES: the A operands are sourced from registers, and an in-flight WGMMA keeps reading them until
+        // it completes, so they are double-buffered by stage parity. Before stage `s` overwrites its buffer,
+        // we wait until only the WGMMA of stage `s - 1` may be in flight, i.e., the WGMMA of stage `s - 2`
+        // (the previous reader of the same buffer) has completed, and its shared memory can be released.
+        DG_STATIC_ASSERT(kNumStages >= 2, "The shared memory of a stage is released two stages later");
+        float a_buffers[2][kNumRegPerWgmma * kNumWgmmaPerBlockK];
+        const auto run_stage = [&](const uint32_t& s, float* a) {
+            ptx::warpgroup_wait<1>();
+            if (s >= 2)
+                empty_barriers[(s - 2) % kNumStages]->arrive();
+
             // Wait TMA arrival
             const auto& stage_idx = s % kNumStages;
             full_barriers[stage_idx]->wait((s / kNumStages) & 1);
 
-            constexpr uint32_t kNumRegPerWgmma = WGMMA::M * WGMMA::K / 128;
-            constexpr uint32_t kNumWgmmaPerBlockK = BLOCK_K / WGMMA::K;
-
-            float a[kNumRegPerWgmma * kNumWgmmaPerBlockK];
             // Assume swizzle A mode is 128
             DG_STATIC_ASSERT(kSwizzleAMode == 128, "Invalid swizzle A mode");
 
@@ -202,10 +210,6 @@ sm90_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
                 sqr_sum_acc_1 += a_float2_0.y * a_float2_0.y + a_float2_1.y * a_float2_1.y;
             }
 
-            ptx::warpgroup_wait<0>();
-            if (s > 0)
-                empty_barriers[(s - 1) % kNumStages]->arrive();
-
             #pragma unroll
             for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
                 ptx::warpgroup_fence_operand(accum[i]);
@@ -228,6 +232,13 @@ sm90_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
             #pragma unroll
             for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
                 ptx::warpgroup_fence_operand(accum[i]);
+        };
+
+        #pragma unroll kNumStages < 8 ? (kNumStages + 1) / 2 : kNumStages / 4
+        for (uint32_t s = 0; s < num_total_stages; s += 2) {
+            run_stage(s, a_buffers[0]);
+            if (s + 1 < num_total_stages)
+                run_stage(s + 1, a_buffers[1]);
         }
 
         const auto& reduced_sum_0 = math::warp_reduce_sum<4>(sqr_sum_acc_0);
@@ -241,6 +252,8 @@ sm90_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
                 sqr_sum[m_offset + m_idx + 8] = reduced_sum_1;
         }
         ptx::warpgroup_wait<0>();
+        if (num_total_stages >= 2)
+            empty_barriers[(num_total_stages - 2) % kNumStages]->arrive();
         empty_barriers[(num_total_stages-1) % kNumStages]->arrive();
 
         // Write accum to shared memory
